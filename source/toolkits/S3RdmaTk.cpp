@@ -3,7 +3,7 @@
 
 #include "toolkits/S3RdmaTk.h"
 
-#if defined(S3_SUPPORT) && defined(CUOBJ_SUPPORT)
+#ifdef S3RDMA_SUPPORT
 
 #include <exception>
 #include <map>
@@ -304,6 +304,9 @@ ssize_t S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx& ctx, const char* token, uin
 		const std::string etag =
 			resp->HasHeader("etag") ? stripQuotes(resp->GetHeader("etag").c_str() ) : "";
 
+		ctx.rdmaChecksumCrc64nvme = resp->HasHeader(AMZ_RDMA_CHECKSUM_CRC64NVME) ?
+			std::string(resp->GetHeader(AMZ_RDMA_CHECKSUM_CRC64NVME).c_str() ) : "";
+
 		// Success: the server completed the RDMA_READ and returns a standard HTTP
 		// 200 + ETag (the object payload moved out-of-band; the HTTP body is empty).
 		if(httpStatus == 200 && !etag.empty() )
@@ -320,7 +323,7 @@ ssize_t S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx& ctx, const char* token, uin
 		std::ostringstream body;
 		body << resp->GetResponseBody().rdbuf();
 
-		if(replyCode == static_cast<int>(RDMA_NOT_SUPPORTED) )
+		if(isRdmaDecline(httpStatus, reply) )
 		{
 			ERRLOGGER(Log_NORMAL, "rdmaPut declined. http=" << httpStatus <<
 				"; x-amz-rdma-reply='" << reply << "'; key=" << ctx.object <<
@@ -380,19 +383,25 @@ ssize_t S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx& ctx, const char* token, uin
 			std::string(resp->GetHeader(AMZ_RDMA_REPLY).c_str() ) : "";
 		const int replyCode = parseRdmaReply(reply);
 
-		if(replyCode == static_cast<int>(RDMA_NOT_SUPPORTED) )
+		if(isRdmaDecline(httpStatus, reply) )
 			return RDMA_NOT_SUPPORTED;
 
 		if(replyCode != RDMA_REPLY_SUCCESS && replyCode != RDMA_REPLY_PARTIAL_CONTENT)
 		{
+			std::ostringstream body;
+			body << resp->GetResponseBody().rdbuf();
+
 			ERRLOGGER(Log_NORMAL, "rdmaGet failed. http=" << httpStatus <<
 				"; x-amz-rdma-reply='" << reply << "'; replyCode=" << replyCode <<
-				"; key=" << ctx.object << std::endl);
+				"; key=" << ctx.object << "; body=" << body.str().substr(0, 400) << std::endl);
 			return RDMA_ERROR;
 		}
 
 		if(resp->HasHeader("etag") )
 			ctx.etag = stripQuotes(resp->GetHeader("etag").c_str() );
+
+		ctx.rdmaChecksumCrc64nvme = resp->HasHeader(AMZ_RDMA_CHECKSUM_CRC64NVME) ?
+			std::string(resp->GetHeader(AMZ_RDMA_CHECKSUM_CRC64NVME).c_str() ) : "";
 
 		if(resp->HasHeader("x-amz-checksum-crc64nvme") )
 			ctx.checksumCrc64nvme = resp->GetHeader("x-amz-checksum-crc64nvme").c_str();
@@ -430,6 +439,8 @@ ssize_t S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx& ctx, const char* token, uin
 // is itself transient (cuObject NIC selection / registration hiccup), so it is
 // retried rather than aborting on the first attempt.
 // ---------------------------------------------------------------------------
+
+#ifdef CUOBJ_SUPPORT
 
 ssize_t rdmaPutWithRetry(SharedCuObjClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
 	void* buf, size_t size)
@@ -479,4 +490,62 @@ ssize_t rdmaGetWithRetry(SharedCuObjClient& rdma, S3RdmaControlPlane& cp, S3Rdma
 	return ret;
 }
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+
+/* Over libfabric the request ends after each attempt, whatever its outcome: the window's key is
+	retired then, so that a late write of a failed attempt cannot land in the buffer while the
+	retry, with a token of the new key, or the next request uses it. */
+
+ssize_t rdmaPutWithRetry(SharedOfiClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
+	void* buf, size_t size)
+{
+	ssize_t ret = RDMA_ERROR;
+
+	for(int attempt = 0; attempt < RDMA_MAX_ATTEMPTS; attempt++)
+	{
+		const std::string token = rdma.getToken(buf, size, 0);
+		if(token.empty() )
+		{
+			ret = RDMA_ERROR;
+			continue; // transient token failure: retry
+		}
+
+		ret = cp.rdmaPut(ctx, token.c_str(), size);
+		rdma.endRequest(buf);
+
+		if(ret > 0 || ret == RDMA_NOT_SUPPORTED)
+			break;
+	}
+
+	return ret;
+}
+
+ssize_t rdmaGetWithRetry(SharedOfiClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
+	void* buf, size_t size, size_t offset)
+{
+	ssize_t ret = RDMA_ERROR;
+
+	for(int attempt = 0; attempt < RDMA_MAX_ATTEMPTS; attempt++)
+	{
+		const std::string token = rdma.getToken(buf, size, 0);
+		if(token.empty() )
+		{
+			ret = RDMA_ERROR;
+			continue; // transient token failure: retry
+		}
+
+		ret = cp.rdmaGet(ctx, token.c_str(), size, offset);
+		rdma.endRequest(buf); // also orders the reads of buf after the provider's writes
+
+		if(ret > 0 || ret == RDMA_NOT_SUPPORTED)
+			break;
+	}
+
+	return ret;
+}
+
+#endif // OFI_SUPPORT
+
+#endif // S3RDMA_SUPPORT

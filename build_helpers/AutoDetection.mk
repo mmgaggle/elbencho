@@ -78,6 +78,18 @@ LDFLAGS_CUOBJ_SUPPORT      += $(LDFLAGS_CUOBJ_PKGCONFIG) -lcuobjclient -lcufile 
 CUOBJ_SUPPORT_DETECT_ARGS   = $(CXXFLAGS_CUOBJ_SUPPORT) $(LDFLAGS_CUOBJ_SUPPORT) \
                               $(CUDA_SUPPORT_DETECT_ARGS)
 
+# Prepare libfabric (ofi-rma) S3-over-RDMA compile/link flags...
+# ofi-rma ships a pkg-config module that pulls in libfabric; PKG_CONFIG_PATH finds an ofi-rma
+# installed outside the default paths.
+OFI_PKGCONFIG_MODULE      ?= $(shell pkg-config --exists ofi-rma 2>/dev/null && echo ofi-rma)
+
+ifneq ($(OFI_PKGCONFIG_MODULE),)
+ CXXFLAGS_OFI_SUPPORT     += $(shell pkg-config --cflags $(OFI_PKGCONFIG_MODULE) 2>/dev/null)
+ LDFLAGS_OFI_SUPPORT      += $(shell pkg-config --libs $(OFI_PKGCONFIG_MODULE) 2>/dev/null)
+endif
+CXXFLAGS_OFI_SUPPORT      += -DOFI_SUPPORT
+OFI_SUPPORT_DETECT_ARGS    = $(CXXFLAGS_OFI_SUPPORT) $(LDFLAGS_OFI_SUPPORT)
+
 ####### LIB "backtrace" ########
 
 # Detect backtrace library to support backtraces with line numbers. If the lib is not available
@@ -200,6 +212,33 @@ ifeq ($(CUOBJ_SUPPORT),1)
 endif
 
 ###### End cuObject (S3-over-RDMA) Support #####
+
+####### libfabric (ofi-rma) S3-over-RDMA Support ########
+##### (Depends on S3_SUPPORT) #####
+
+# Auto-enable when ofi-rma and libfabric are found and S3 support is on. ofi-rma registers I/O
+# buffers as libfabric windows and mints the tokens that the S3 server's storage nodes use to
+# write into them (GET) or read from them (PUT).
+ifeq ($(OFI_SUPPORT),)
+ ifeq ($(S3_SUPPORT),1)
+  ifdef BUILD_VERBOSE
+   $(info [TEST_OFI] $(CXX) -o $(TEST_OBJ_FILE) $(TEST_C_FILE) $(OFI_SUPPORT_DETECT_ARGS) )
+  endif
+
+  OFI_SUPPORT := $(shell \
+     if $(CXX) -o $(TEST_OBJ_FILE) $(TEST_C_FILE) $(OFI_SUPPORT_DETECT_ARGS) 1>/dev/null 2>&1; \
+     then echo 1; \
+     else echo 0; \
+     fi)
+ endif
+endif
+
+ifeq ($(OFI_SUPPORT),1)
+ CXXFLAGS     += $(CXXFLAGS_OFI_SUPPORT)
+ LDFLAGS      += $(LDFLAGS_OFI_SUPPORT)
+endif
+
+###### End libfabric (ofi-rma) S3-over-RDMA Support #####
 
 ########## CUDA Support #############
 

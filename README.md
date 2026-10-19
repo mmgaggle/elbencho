@@ -24,6 +24,7 @@ elbencho was inspired by traditional storage benchmark tools like [fio](https://
   - [Nvidia GPUDirect Storage \(GDS\) Support](#nvidia-gpudirect-storage-gds-support)
   - [S3 Object Storage Support](#s3-object-storage-support)
   - [GPU-Direct S3-over-RDMA \(cuObject\) Support](#gpu-direct-s3-over-rdma-cuobject-support)
+  - [S3-over-RDMA through libfabric \(ofi-rma\) Support](#s3-over-rdma-through-libfabric-ofi-rma-support)
   - [macOS Support](#macos-support)
   - [NVMe-oF Support](#nvme-of-support)
 
@@ -220,6 +221,28 @@ LD_LIBRARY_PATH=/path/to/cuobject/lib \
 ```
 
 Add `--gpuids <id>` to the command above for VRAM-direct transfers, and `--s3insecure` if the endpoint uses a self-signed certificate. The RDMA control request is pinned to HTTP/1.1, so the `x-amz-rdma-*` header exchange doesn't depend on HTTP/2 negotiation.
+
+#### S3-over-RDMA through libfabric (ofi-rma) Support
+
+The `--s3ofi PROVIDER` option sends single-part S3 GET and PUT over libfabric, with the [ofi-rma](https://github.com/mmgaggle/ofi-rma) library. It is the libfabric counterpart of `--cuobj`, for S3 servers that take ofi-rma tokens, such as Ceph RGW with OSD-direct transfers. The storage nodes write the data of a GET into the I/O buffer, and read the data of a PUT out of it. A small HTTP request without a body carries the buffer's token in `x-amz-rdma-token`. The provider is any one that the storage nodes also run, such as `tcp`, `verbs;ofi_rxm` or `uet`.
+
+When pkg-config finds ofi-rma and a test program links with it, a build with `S3_SUPPORT=1` enables the feature. Set `PKG_CONFIG_PATH` for an ofi-rma that is installed outside the default paths. `OFI_SUPPORT=0|1` turns the feature off or on.
+
+**Window keys:** a provider can deliver a copy of a write after the request that it belongs to completed, as UET's RUDI mode does. So elbencho gives the buffer a new memory key after each request, before it uses the buffer again: a late copy then fails instead of landing. A provider's registration cache can hand back the old key, so elbencho sets `FI_MR_CACHE_MONITOR=disabled` unless you set it.
+
+**Checksums:** with `--s3chksumalgo CRC64NVME`, a PUT sends the CRC-64/NVME of the buffer, and the server refuses a payload that does not match. elbencho also compares the storage nodes' CRC of what they read or placed (`x-amz-rdma-checksum-crc64nvme`) with its own, also for a range. A whole-object GET is also compared with the stored checksum.
+
+**Constraints:** the same as for `--cuobj`. The block size (`-b`) must equal the object size (`-s`), and `--iodepth=1` is required. An RDMA decline or failure is a hard error. PUT needs a provider with RMA reads. GPU memory (`--gpuids`) needs a provider with FI_HMEM.
+
+Example (16 threads, 8 MiB objects, the verbs provider on the RDMA device `mlx5_0`):
+
+```bash
+elbencho --s3endpoints http://RGW:8000 --s3key KEY --s3secret SECRET \
+    --s3ofi 'verbs;ofi_rxm' --s3ofidomain mlx5_0 --s3chksumalgo CRC64NVME \
+    --iodepth 1 -w -r -t 16 -s 8m -b 8m mybucket
+```
+
+`--s3ofinode` sets the local address that the provider binds, which the storage nodes must reach.
 
 #### macOS Support
 

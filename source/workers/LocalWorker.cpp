@@ -477,8 +477,9 @@ void LocalWorker::finishPhase()
 
 	if(numS3RdmaChecksumsVerified)
 	{
-		LOGGER(Log_VERBOSE, "Worker " << workerRank << ": S3 RDMA whole-object reads verified "
-			"against x-amz-checksum-crc64nvme: " << numS3RdmaChecksumsVerified << std::endl);
+		LOGGER(Log_VERBOSE, "Worker " << workerRank << ": S3 RDMA CRC-64/NVME checks passed "
+			"(x-amz-checksum-crc64nvme of whole-object reads, x-amz-rdma-checksum-crc64nvme of "
+			"transfers): " << numS3RdmaChecksumsVerified << std::endl);
 		numS3RdmaChecksumsVerified = 0;
 	}
 
@@ -611,8 +612,9 @@ void LocalWorker::uninitS3Client()
 }
 
 /**
- * Initialize the cuObject (GPU-direct S3-over-RDMA) control plane and register the I/O buffers for
- * RDMA. Called from initS3Client() after the I/O buffers have been allocated.
+ * Initialize the S3-over-RDMA control plane and register the I/O buffers for RDMA, with cuObject
+ * (GPU-direct S3-over-RDMA) or with libfabric (ofi-rma). Called from initS3Client() after the I/O
+ * buffers have been allocated.
  *
  * When GPUs are given, the GPU VRAM buffers are registered for true GPU-direct transfers; otherwise
  * the host buffers are registered.
@@ -621,56 +623,151 @@ void LocalWorker::uninitS3Client()
  */
 void LocalWorker::initS3RdmaBuffers()
 {
-#if defined(S3_SUPPORT) && defined(CUOBJ_SUPPORT)
+#ifdef S3RDMA_SUPPORT
 
-	if(!progArgs->getUseCuObj() || (progArgs->getBenchMode() != BenchMode_S3) )
+	if(!progArgs->getUseS3Rdma() || (progArgs->getBenchMode() != BenchMode_S3) )
 		return; // nothing to do
 
-	s3RdmaClient = SharedCuObjClient::getInstance();
-	if(!s3RdmaClient)
-		throw WorkerException("S3 RDMA requested, but the cuObject RDMA fabric is not available "
-			"(cuObjClient failed to connect).");
+	const bool areGPUsGiven = !progArgs->getGPUIDsVec().empty();
+	BufferVec& rdmaBufVec = areGPUsGiven ? gpuIOBufVec : ioBufVec;
+
+#ifdef CUOBJ_SUPPORT
+	if(progArgs->getUseCuObj() )
+	{
+		s3RdmaClient = SharedCuObjClient::getInstance();
+		if(!s3RdmaClient)
+			throw WorkerException("S3 RDMA requested, but the cuObject RDMA fabric is not "
+				"available (cuObjClient failed to connect).");
+	}
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+	if(progArgs->getUseS3Ofi() )
+	{
+		s3OfiClient = SharedOfiClient::getInstance(progArgs->getS3OfiProvider(),
+			progArgs->getS3OfiDomain(), progArgs->getS3OfiNode(), areGPUsGiven);
+		if(!s3OfiClient)
+			throw WorkerException("S3 RDMA requested, but the libfabric endpoint could not be "
+				"opened. Provider: " + progArgs->getS3OfiProvider() );
+
+		if(areGPUsGiven && !s3OfiClient->canUseGPUMem() )
+			throw WorkerException("S3 RDMA into GPU memory requested, but the libfabric provider "
+				"does not offer FI_HMEM. Provider: " + progArgs->getS3OfiProvider() );
+
+		if(progArgs->getRunCreateFilesPhase() && !s3OfiClient->canRead() )
+			throw WorkerException("S3 RDMA uploads need RMA reads, which the libfabric provider "
+				"does not offer. Provider: " + progArgs->getS3OfiProvider() );
+	}
+#endif // OFI_SUPPORT
 
 	s3RdmaControlPlane = std::make_unique<S3RdmaControlPlane>(progArgs, workerRank);
 	if(!s3RdmaControlPlane->isValid() )
 		throw WorkerException("S3 RDMA requested, but the RDMA control plane could not be "
 			"initialized. Check S3 endpoint and credentials.");
 
-	const bool areGPUsGiven = !progArgs->getGPUIDsVec().empty();
-	BufferVec& rdmaBufVec = areGPUsGiven ? gpuIOBufVec : ioBufVec;
-
 	for(char* buf : rdmaBufVec)
 	{
 		if(!buf)
 			continue;
 
-		if(!s3RdmaClient->registerBuffer(buf, progArgs->getBlockSize() ) )
+#ifdef CUOBJ_SUPPORT
+		if(s3RdmaClient && !s3RdmaClient->registerBuffer(buf, progArgs->getBlockSize() ) )
 			throw WorkerException("Registration of I/O buffer with cuObject for RDMA failed.");
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+	#ifdef CUDA_SUPPORT
+		const int ofiGPUID = gpuID;
+	#else
+		const int ofiGPUID = 0; // no GPU buffers without CUDA
+	#endif
+
+		if(s3OfiClient && !s3OfiClient->registerBuffer(buf, progArgs->getBlockSize(),
+			areGPUsGiven, ofiGPUID) )
+			throw WorkerException("Registration of I/O buffer with libfabric for RDMA failed.");
+#endif // OFI_SUPPORT
 
 		s3RdmaRegisteredBufVec.push_back(buf);
 	}
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#endif // S3RDMA_SUPPORT
+}
+
+#ifdef S3RDMA_SUPPORT
+
+/**
+ * Single-part S3-over-RDMA PUT of buf, with the transport in use: cuObject or libfabric. See
+ * rdmaPutWithRetry().
+ */
+ssize_t LocalWorker::s3RdmaPut(S3RdmaClientCtx& ctx, char* buf, size_t size)
+{
+#ifdef OFI_SUPPORT
+	if(s3OfiClient)
+		return rdmaPutWithRetry(*s3OfiClient, *s3RdmaControlPlane, ctx, buf, size);
+#endif // OFI_SUPPORT
+
+#ifdef CUOBJ_SUPPORT
+	if(s3RdmaClient)
+		return rdmaPutWithRetry(*s3RdmaClient, *s3RdmaControlPlane, ctx, buf, size);
+#endif // CUOBJ_SUPPORT
+
+	return S3Rdma::RDMA_ERROR;
 }
 
 /**
- * Deregister RDMA buffers and release the cuObject control plane. Called from uninitS3Client().
+ * S3-over-RDMA GET of [offset, offset+size) of an object into buf, with the transport in use. See
+ * rdmaGetWithRetry().
+ */
+ssize_t LocalWorker::s3RdmaGet(S3RdmaClientCtx& ctx, char* buf, size_t size, size_t offset)
+{
+#ifdef OFI_SUPPORT
+	if(s3OfiClient)
+		return rdmaGetWithRetry(*s3OfiClient, *s3RdmaControlPlane, ctx, buf, size, offset);
+#endif // OFI_SUPPORT
+
+#ifdef CUOBJ_SUPPORT
+	if(s3RdmaClient)
+		return rdmaGetWithRetry(*s3RdmaClient, *s3RdmaControlPlane, ctx, buf, size, offset);
+#endif // CUOBJ_SUPPORT
+
+	return S3Rdma::RDMA_ERROR;
+}
+
+#endif // S3RDMA_SUPPORT
+
+/**
+ * Deregister RDMA buffers and release the S3-over-RDMA control plane. Called from
+ * uninitS3Client().
  */
 void LocalWorker::uninitS3RdmaBuffers()
 {
-#if defined(S3_SUPPORT) && defined(CUOBJ_SUPPORT)
+#ifdef S3RDMA_SUPPORT
 
-	if(s3RdmaClient)
+	for(char* buf : s3RdmaRegisteredBufVec)
 	{
-		for(char* buf : s3RdmaRegisteredBufVec)
+#ifdef CUOBJ_SUPPORT
+		if(s3RdmaClient)
 			s3RdmaClient->deregisterBuffer(buf);
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+		if(s3OfiClient)
+			s3OfiClient->deregisterBuffer(buf);
+#endif // OFI_SUPPORT
 	}
 
 	s3RdmaRegisteredBufVec.clear();
 	s3RdmaControlPlane.reset();
-	s3RdmaClient = NULL; // singleton, not owned
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#ifdef CUOBJ_SUPPORT
+	s3RdmaClient = NULL; // singleton, not owned
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+	s3OfiClient = NULL; // singleton, not owned
+#endif // OFI_SUPPORT
+
+#endif // S3RDMA_SUPPORT
 }
 
 void LocalWorker::initHDFS()
@@ -5423,13 +5520,13 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 	throw WorkerException(std::string(__func__) + "called, but this was built without S3 support");
 #else
 
-#ifdef CUOBJ_SUPPORT
-	if(progArgs->getUseCuObj() )
+#ifdef S3RDMA_SUPPORT
+	if(progArgs->getUseS3Rdma() )
 	{
 		s3ModeUploadObjectSinglePartRdma(bucketName, objectName);
 		return;
 	}
-#endif // CUOBJ_SUPPORT
+#endif // S3RDMA_SUPPORT
 
 	const uint64_t currentOffset = rwOffsetGen->getNextOffset();
 	const size_t blockSize = rwOffsetGen->getNextBlockSizeToSubmit();
@@ -5514,7 +5611,8 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 }
 
 /**
- * Single-part upload of an S3 object via GPU-direct S3-over-RDMA (NVIDIA cuObject).
+ * Single-part upload of an S3 object via S3-over-RDMA: GPU-direct through NVIDIA cuObject, or
+ * through libfabric (ofi-rma).
  *
  * The object payload moves out-of-band over RDMA (server RDMA_READ from the registered buffer);
  * a body-less HTTP control request carries the x-amz-rdma-token and reads the x-amz-rdma-* reply.
@@ -5525,9 +5623,9 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
  */
 void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::string objectName)
 {
-#if !defined(S3_SUPPORT) || !defined(CUOBJ_SUPPORT)
+#ifndef S3RDMA_SUPPORT
 	throw WorkerException(std::string(__func__) +
-		" called, but this was built without S3 RDMA (cuObject) support");
+		" called, but this was built without S3 RDMA (cuObject or libfabric) support");
 #else
 
 	const uint64_t currentOffset = rwOffsetGen->getNextOffset();
@@ -5562,7 +5660,7 @@ void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::
 
 	OPLOG_PRE_OP("S3PutObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize);
 
-	ssize_t rdmaRes = rdmaPutWithRetry(*s3RdmaClient, *s3RdmaControlPlane, ctx, rdmaBuf, blockSize);
+	ssize_t rdmaRes = s3RdmaPut(ctx, rdmaBuf, blockSize);
 
 	OPLOG_POST_OP("S3PutObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize,
 		rdmaRes <= 0);
@@ -5577,6 +5675,22 @@ void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::
 			"Offset: " + std::to_string(currentOffset) + "; "
 			"Blocksize: " + std::to_string(blockSize) + "; "
 			"RDMA result: " + std::to_string(rdmaRes) );
+
+	/* the storage nodes' CRC of what they read (libfabric): it must be the buffer's, whether or
+		not the client sent a checksum for the server to verify */
+	if( (rdmaRes > 0) && !ctx.rdmaChecksumCrc64nvme.empty() &&
+		(s3ChecksumAlgorithm == S3ChecksumAlgorithm::CRC64NVME) )
+	{
+		IF_UNLIKELY(ctx.rdmaChecksumCrc64nvme != ctx.checksumCrc64nvme)
+			throw WorkerException(std::string("S3 RDMA checksum mismatch. ") +
+				"Endpoint: " + s3EndpointStr + "; "
+				"Bucket: " + bucketName + "; "
+				"Object: " + objectName + "; "
+				"x-amz-rdma-checksum-crc64nvme: " + ctx.rdmaChecksumCrc64nvme + "; "
+				"sent: " + ctx.checksumCrc64nvme);
+
+		numS3RdmaChecksumsVerified++;
+	}
 
 	if(rdmaRes > 0)
 		atomicLiveOps.numBytesDone += rdmaRes;
@@ -5595,7 +5709,7 @@ void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::
 	rwOffsetGen->addBytesSubmitted(blockSize);
 	atomicLiveOps.numIOPSDone++;
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#endif // S3RDMA_SUPPORT
 }
 
 /**
@@ -6864,13 +6978,13 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 	throw WorkerException(std::string(__func__) + "called, but this was built without S3 support");
 #else
 
-#ifdef CUOBJ_SUPPORT
-	if(progArgs->getUseCuObj() )
+#ifdef S3RDMA_SUPPORT
+	if(progArgs->getUseS3Rdma() )
 	{
 		s3ModeDownloadObjectRdma(bucketName, objectName, isRWMixedReader);
 		return;
 	}
-#endif // CUOBJ_SUPPORT
+#endif // S3RDMA_SUPPORT
 
 	const bool useS3FastRead = progArgs->getUseS3FastRead();
 	const bool ignoreS3Errors = progArgs->getIgnoreS3Errors();
@@ -7003,7 +7117,8 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 }
 
 /**
- * Block-sized download of an S3 object via GPU-direct S3-over-RDMA (NVIDIA cuObject).
+ * Block-sized download of an S3 object via S3-over-RDMA: GPU-direct through NVIDIA cuObject, or
+ * through libfabric (ofi-rma).
  *
  * The object payload moves out-of-band over RDMA (server RDMA_WRITE into the registered buffer);
  * a body-less HTTP control request carries the x-amz-rdma-token and reads the x-amz-rdma-* reply.
@@ -7018,9 +7133,9 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string objectName,
 	const bool isRWMixedReader)
 {
-#if !defined(S3_SUPPORT) || !defined(CUOBJ_SUPPORT)
+#ifndef S3RDMA_SUPPORT
 	throw WorkerException(std::string(__func__) +
-		" called, but this was built without S3 RDMA (cuObject) support");
+		" called, but this was built without S3 RDMA (cuObject or libfabric) support");
 #else
 
 	const bool ignoreS3Errors = progArgs->getIgnoreS3Errors();
@@ -7049,8 +7164,7 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 
 		OPLOG_PRE_OP("S3GetObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize);
 
-		ssize_t rdmaRes = rdmaGetWithRetry(*s3RdmaClient, *s3RdmaControlPlane, ctx, rdmaBuf,
-			blockSize, currentOffset);
+		ssize_t rdmaRes = s3RdmaGet(ctx, rdmaBuf, blockSize, currentOffset);
 
 		OPLOG_POST_OP("S3GetObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize,
 			rdmaRes <= 0);
@@ -7103,6 +7217,28 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 			numS3RdmaChecksumsVerified++;
 		}
 
+		/* the storage nodes' CRC of what they placed (libfabric), which covers a range too: it
+			must be the CRC of what is in the buffer */
+		if( (rdmaRes > 0) && !ctx.rdmaChecksumCrc64nvme.empty() &&
+			(s3ChecksumAlgorithm == S3ChecksumAlgorithm::CRC64NVME) )
+		{
+			uint64_t crc = rdmaBufCrc64Nvme(rdmaBuf, rdmaRes, areGPUsGiven);
+			if(getenv("ELBENCHO_S3RDMA_CORRUPT_CHECKSUM") ) // test hook: must be reported
+				crc ^= 1;
+			const std::string computed = Crc64Nvme::toBase64(crc);
+
+			IF_UNLIKELY(computed != ctx.rdmaChecksumCrc64nvme)
+				throw WorkerException(std::string("S3 RDMA checksum mismatch. ") +
+					"Endpoint: " + s3EndpointStr + "; "
+					"Bucket: " + bucketName + "; "
+					"Object: " + objectName + "; "
+					"Offset: " + std::to_string(currentOffset) + "; "
+					"x-amz-rdma-checksum-crc64nvme: " + ctx.rdmaChecksumCrc64nvme + "; "
+					"computed: " + computed);
+
+			numS3RdmaChecksumsVerified++;
+		}
+
 		if(rdmaRes > 0)
 		{
 			if(isRWMixedReader)
@@ -7132,7 +7268,7 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 		rwOffsetGen->addBytesSubmitted(blockSize);
 	}
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#endif // S3RDMA_SUPPORT
 }
 
 /**

@@ -127,7 +127,8 @@ class LocalWorker : public Worker
 		RateLimiterRWMixThreads rateLimiterRWMixThreads; // for r/w threads rate balance if set
 
 		uint64_t numIOPSSubmitted{0}; // internal sequential counter, not reset between phases
-		uint64_t numS3RdmaChecksumsVerified{0}; // whole-object RDMA GETs checked against x-amz-checksum-crc64nvme
+		uint64_t numS3RdmaChecksumsVerified{0}; /* RDMA transfers checked against
+			x-amz-checksum-crc64nvme (whole-object GETs) or x-amz-rdma-checksum-crc64nvme */
 
 		// phase-dependent variables
 		BenchPhase benchPhase{BenchPhase_IDLE};
@@ -170,10 +171,15 @@ class LocalWorker : public Worker
 		S3ChecksumAlgorithm s3ChecksumAlgorithm; // for x-amz-sdk-checksum-algorithm header
 #endif
 
-#if defined(S3_SUPPORT) && defined(CUOBJ_SUPPORT)
+#ifdef S3RDMA_SUPPORT
+#ifdef CUOBJ_SUPPORT
         SharedCuObjClient* s3RdmaClient{NULL}; // process-wide cuObject singleton (not owned)
+#endif
+#ifdef OFI_SUPPORT
+        SharedOfiClient* s3OfiClient{NULL}; // process-wide libfabric endpoint (not owned)
+#endif
         std::unique_ptr<S3RdmaControlPlane> s3RdmaControlPlane; // per-worker RDMA control plane
-        BufferVec s3RdmaRegisteredBufVec; // buffers registered with cuObject (for deregister)
+        BufferVec s3RdmaRegisteredBufVec; // buffers registered for RDMA (for deregister)
 #endif
 
 #ifdef HDFS_SUPPORT
@@ -224,6 +230,10 @@ class LocalWorker : public Worker
 		void uninitS3Client();
 		void initS3RdmaBuffers();
 		void uninitS3RdmaBuffers();
+#ifdef S3RDMA_SUPPORT
+		ssize_t s3RdmaPut(S3RdmaClientCtx& ctx, char* buf, size_t size);
+		ssize_t s3RdmaGet(S3RdmaClientCtx& ctx, char* buf, size_t size, size_t offset);
+#endif
 		void initHDFS();
 		void uninitHDFS();
 		void initNetBench();

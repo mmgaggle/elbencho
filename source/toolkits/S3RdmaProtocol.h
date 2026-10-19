@@ -5,8 +5,14 @@
 #define TOOLKITS_S3RDMAPROTOCOL_H_
 
 // S3-over-RDMA wire protocol helpers (the "x-amz-rdma-*" header convention used
-// by NVIDIA cuObject). Kept free of any AWS SDK or cuObject dependency so the
-// protocol logic stays independently testable.
+// by NVIDIA cuObject, and by Ceph RGW for libfabric tokens). Kept free of any AWS
+// SDK, cuObject or libfabric dependency so the protocol logic stays independently
+// testable.
+
+// S3-over-RDMA needs S3 and one of its transports: cuObject or libfabric (ofi-rma)
+#if defined(S3_SUPPORT) && (defined(CUOBJ_SUPPORT) || defined(OFI_SUPPORT) )
+	#define S3RDMA_SUPPORT
+#endif
 
 #include <charconv>
 #include <cstdint>
@@ -21,6 +27,9 @@ namespace S3Rdma
 	inline constexpr const char* AMZ_RDMA_TOKEN = "x-amz-rdma-token";
 	inline constexpr const char* AMZ_RDMA_REPLY = "x-amz-rdma-reply";
 	inline constexpr const char* AMZ_RDMA_BYTES_TRANSFERRED = "x-amz-rdma-bytes-transferred";
+	/* the storage nodes' CRC-64/NVME of the bytes they placed (GET) or read (PUT), which a Ceph
+		RGW returns for a transfer over libfabric; a range included */
+	inline constexpr const char* AMZ_RDMA_CHECKSUM_CRC64NVME = "x-amz-rdma-checksum-crc64nvme";
 
 	// SigV4 payload hash sentinel for body-less RDMA control-plane requests.
 	inline constexpr const char* UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
@@ -71,6 +80,21 @@ namespace S3Rdma
 			return 0; // malformed -> caller treats as failure
 
 		return value;
+	}
+
+	/**
+	 * Whether a response that reports no RDMA success is a decline: the server did not take the
+	 * token, so a client could send the payload over HTTP instead. That is x-amz-rdma-reply 501, or
+	 * no x-amz-rdma-reply with HTTP 501 or with a status that does not fail the request (a server
+	 * that ignores the token). An S3 error without the header, such as 400 BadDigest, 403
+	 * AccessDenied or 404 NoSuchKey, is a failure of the request, not a decline.
+	 */
+	inline bool isRdmaDecline(int httpStatus, const std::string& reply)
+	{
+		if(reply == "501")
+			return true;
+
+		return reply.empty() && ( (httpStatus == 501) || (httpStatus < 400) );
 	}
 
 } // namespace S3Rdma

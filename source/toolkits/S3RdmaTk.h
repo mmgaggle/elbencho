@@ -6,13 +6,14 @@
 
 #include "toolkits/S3RdmaProtocol.h"
 
-#if defined(S3_SUPPORT) && defined(CUOBJ_SUPPORT)
+#ifdef S3RDMA_SUPPORT
 
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "toolkits/CuObjClientTk.h"
+#include "toolkits/OfiClientTk.h"
 
 class ProgArgs;
 
@@ -35,6 +36,9 @@ struct S3RdmaClientCtx
 	/* set by the caller when the GET covers the whole object: rdmaGet then sends no Range header,
 		which is what lets the server return the stored full-object checksum */
 	bool wholeObject = false;
+	/* x-amz-rdma-checksum-crc64nvme of the reply, if any: the storage nodes' CRC-64/NVME of the
+		bytes that they placed (GET) or read (PUT), a range included (base64, as S3 encodes it) */
+	std::string rdmaChecksumCrc64nvme;
 };
 
 /**
@@ -74,6 +78,8 @@ class S3RdmaControlPlane
 		bool valid = false;
 };
 
+#ifdef CUOBJ_SUPPORT
+
 /**
  * Mint a token, run rdmaPut, release the token, with one transient retry. The
  * buffer must already be registered via SharedCuObjClient::registerBuffer().
@@ -87,6 +93,26 @@ ssize_t rdmaPutWithRetry(SharedCuObjClient& rdma, S3RdmaControlPlane& cp, S3Rdma
 ssize_t rdmaGetWithRetry(SharedCuObjClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
 	void* buf, size_t size, size_t offset);
 
-#endif // S3_SUPPORT && CUOBJ_SUPPORT
+#endif // CUOBJ_SUPPORT
+
+#ifdef OFI_SUPPORT
+
+/**
+ * The same over libfabric: take the token of the buffer's window, run rdmaPut, and end the
+ * request, which retires the window's key, with one transient retry. The buffer must already be
+ * registered via SharedOfiClient::registerBuffer().
+ *
+ * @return >0 bytes transferred (success), RDMA_NOT_SUPPORTED (server declined),
+ *     or RDMA_ERROR (failure). There is no HTTP fallback.
+ */
+ssize_t rdmaPutWithRetry(SharedOfiClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
+	void* buf, size_t size);
+
+ssize_t rdmaGetWithRetry(SharedOfiClient& rdma, S3RdmaControlPlane& cp, S3RdmaClientCtx& ctx,
+	void* buf, size_t size, size_t offset);
+
+#endif // OFI_SUPPORT
+
+#endif // S3RDMA_SUPPORT
 
 #endif // TOOLKITS_S3RDMATK_H_

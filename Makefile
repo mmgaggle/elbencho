@@ -422,6 +422,12 @@ else
 	$(info [OPT] cuObject (S3-over-RDMA) support disabled)
 endif
 
+ifeq ($(OFI_SUPPORT),1)
+	$(info [OPT] libfabric (ofi-rma) S3-over-RDMA support enabled)
+else
+	$(info [OPT] libfabric (ofi-rma) S3-over-RDMA support disabled)
+endif
+
 ifeq ($(CUDA_SUPPORT),1)
  ifdef BUILD_VERBOSE
 	$(info [OPT] CUDA support enabled (CUDA_INCLUDE_PATH: $(CUDA_INCLUDE_PATH)))
@@ -639,6 +645,12 @@ help:
 	@echo '                             (libibverbs, librdmacm). By default it is enabled'
 	@echo '                             when the cuObject development files are found.'
 	@echo '                             (cuobjclient.h and libcuobjclient.so)'
+	@echo '   OFI_SUPPORT=0|1         - Manually enable (=1) or disable (=0) support for'
+	@echo '                             S3-over-RDMA through libfabric (ofi-rma), for S3'
+	@echo '                             servers that take ofi-rma tokens, such as Ceph'
+	@echo '                             RGW. Requires S3_SUPPORT=1. By default it is'
+	@echo '                             enabled when pkg-config finds ofi-rma (set'
+	@echo '                             PKG_CONFIG_PATH for an ofi-rma installed elsewhere).'
 	@echo '   CYGWIN_SUPPORT=0|1      - Reduce build features to enable build in Cygwin'
 	@echo '                             environment. (Default: 0)'
 	@echo '   HDFS_SUPPORT=0|1        - Build with support for Hadoop HDFS. HADOOP_HOME'

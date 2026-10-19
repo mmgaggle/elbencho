@@ -194,6 +194,9 @@ namespace bpt = boost::property_tree;
 #define ARG_S3OBJLOCKCFG_LONG            "s3olockcfg"
 #define ARG_S3OBJLOCKCFGVERIFY_LONG      "s3olockcfgverify"
 #define ARG_S3OBJTAG_LONG                "s3otag"
+#define ARG_S3OFI_LONG                   "s3ofi"
+#define ARG_S3OFIDOMAIN_LONG             "s3ofidomain"
+#define ARG_S3OFINODE_LONG               "s3ofinode"
 #define ARG_S3OBJTAGVERIFY_LONG          "s3otagverify"
 #define ARG_S3RANDOBJ_LONG               "s3randobj"
 #define ARG_S3REGION_LONG                "s3region"
@@ -544,6 +547,10 @@ class ProgArgs
         bool s3NoTlsVerify; // don't verify s3 server tls certificates (e.g. self-signed)
         std::string s3ObjectPrefix; // object name/path prefix for s3 "directory mode"
         std::string s3Region; // s3 region
+        std::string s3OfiProvider; /* libfabric provider for S3-over-RDMA through ofi-rma (e.g.
+                                        "tcp", "verbs;ofi_rxm", "uet"); empty for none */
+        std::string s3OfiDomain; // libfabric domain (device or interface) of s3OfiProvider
+        std::string s3OfiNode; // local address that s3OfiProvider binds
         std::string s3SessionToken; // s3 session token (same as secret token)
         unsigned short s3SignPolicy; /* Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy; note:
             "2=never" is ignored, because as of aws sdk cpp v1.11.486 signing is always done. */
@@ -877,6 +884,11 @@ class ProgArgs
         bool getUseCuFile() const { return useCuFile; }
         bool getUseCuFileDriverOpen() const { return useCuFileDriverOpen; }
         bool getUseCuObj() const { return useCuObj; }
+        const std::string& getS3OfiProvider() const { return s3OfiProvider; }
+        const std::string& getS3OfiDomain() const { return s3OfiDomain; }
+        const std::string& getS3OfiNode() const { return s3OfiNode; }
+        bool getUseS3Ofi() const { return !s3OfiProvider.empty(); }
+        bool getUseS3Rdma() const { return useCuObj || getUseS3Ofi(); } // cuObject or libfabric
         bool getUseCuHostBufReg() const { return useCuHostBufReg; }
         bool getUseCustomTreeRandomize() const { return useCustomTreeRandomize; }
         bool getUseCustomTreeRoundRobin() const { return useCustomTreeRoundRobin; }

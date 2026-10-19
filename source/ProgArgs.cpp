@@ -316,6 +316,27 @@ void ProgArgs::defineAllowedArgs()
 			"to object size (single-part) and \"--" ARG_IODEPTH_LONG "=1\". An RDMA "
 			"decline/failure is a hard error (no HTTP fallback).")
 #endif
+#ifdef OFI_SUPPORT
+/*s3o*/	(ARG_S3OFI_LONG, bpo::value(&this->s3OfiProvider),
+			"Use S3-over-RDMA through libfabric (ofi-rma) with the given provider, e.g. \"tcp\", "
+			"\"verbs;ofi_rxm\" or \"uet\". The libfabric counterpart of \"--" ARG_CUOBJ_LONG "\", "
+			"for S3 servers that take ofi-rma tokens, such as Ceph RGW with OSD-direct transfers: "
+			"the storage nodes write the data of a single-part GET into the I/O buffer, and read "
+			"the data of a single-part PUT out of it, while a body-less HTTP request carries the "
+			"buffer's token in x-amz-rdma-token. The key of the buffer is retired after each "
+			"request, so that no late write of it lands in the next one. GPU memory (\"--"
+			ARG_GPUIDS_LONG "\") needs a provider with FI_HMEM. Same requirements as \"--"
+			ARG_CUOBJ_LONG "\": an RDMA-capable S3 endpoint, block size equal to object size and "
+			"\"--" ARG_IODEPTH_LONG "=1\". An RDMA decline/failure is a hard error (no HTTP "
+			"fallback).")
+/*s3o*/	(ARG_S3OFIDOMAIN_LONG, bpo::value(&this->s3OfiDomain),
+			"libfabric domain for \"--" ARG_S3OFI_LONG "\": an RDMA device (e.g. \"mlx5_0\") or a "
+			"network interface, as the provider names its domains. (Default: the provider's "
+			"choice)")
+/*s3o*/	(ARG_S3OFINODE_LONG, bpo::value(&this->s3OfiNode),
+			"Local address that the provider of \"--" ARG_S3OFI_LONG "\" binds, which the storage "
+			"nodes reach. (Default: the provider's choice)")
+#endif
 #ifdef CUDA_SUPPORT
 /*cu*/	(ARG_CUHOSTBUFREG_LONG, bpo::bool_switch(&this->useCuHostBufReg),
 			"Pin host memory buffers and register with CUDA for faster transfer to/from GPU.")
@@ -1618,22 +1639,39 @@ void ProgArgs::checkArgs()
             throw ProgException("Option \"--" ARG_CUOBJ_LONG "\" requires a build with cuObject "
                 "(GPU-direct S3-over-RDMA) support, but this executable was built without it.");
         #endif // CUOBJ_SUPPORT
+    }
+
+    if(getUseS3Ofi() )
+    {
+        #ifndef OFI_SUPPORT
+            throw ProgException("Option \"--" ARG_S3OFI_LONG "\" requires a build with libfabric "
+                "(ofi-rma) S3-over-RDMA support, but this executable was built without it.");
+        #endif // OFI_SUPPORT
+
+        if(useCuObj)
+            throw ProgException("Options \"--" ARG_CUOBJ_LONG "\" and \"--" ARG_S3OFI_LONG "\" "
+                "cannot be used together.");
+    }
+
+    if(getUseS3Rdma() )
+    {
+        const std::string rdmaArg = useCuObj ? ("--" ARG_CUOBJ_LONG) : ("--" ARG_S3OFI_LONG);
 
         if(benchMode != BenchMode_S3)
-            throw ProgException("Option \"--" ARG_CUOBJ_LONG "\" can only be used with S3.");
+            throw ProgException("Option \"" + rdmaArg + "\" can only be used with S3.");
 
         if(ioDepth != 1)
-            throw ProgException("Option \"--" ARG_CUOBJ_LONG "\" requires \"--"
+            throw ProgException("Option \"" + rdmaArg + "\" requires \"--"
                 ARG_IODEPTH_LONG "=1\" (async/multi-depth transfers are not supported on the "
                 "RDMA path).");
 
         if(useS3FastRead)
-            throw ProgException("Option \"--" ARG_CUOBJ_LONG "\" cannot be used together with "
+            throw ProgException("Option \"" + rdmaArg + "\" cannot be used together with "
                 "\"--" ARG_S3FASTGET_LONG "\", which discards downloaded data and thus has no "
                 "buffer to receive the RDMA transfer.");
 
         if(fileSize && blockSize && (blockSize < fileSize) )
-            throw ProgException("Option \"--" ARG_CUOBJ_LONG "\" requires single-part transfers, "
+            throw ProgException("Option \"" + rdmaArg + "\" requires single-part transfers, "
                 "i.e. the block size (\"-" ARG_BLOCK_SHORT "\") must be equal to or larger than "
                 "the object size (\"-" ARG_FILESIZE_SHORT "\"). Multi-part RDMA transfers are not "
                 "supported. "
@@ -3880,6 +3918,11 @@ void ProgArgs::printHelpS3()
 			ARG_CUFILE_LONG "\") for single-part object GET/PUT. Requires a build with cuObject "
 			"support (CUDA 13.1+) and an RDMA-capable S3 endpoint. Use \"--" ARG_GPUIDS_LONG
 			"\" for VRAM-direct transfers.")
+		(ARG_S3OFI_LONG, bpo::value(&this->s3OfiProvider),
+			"Use S3-over-RDMA through libfabric with the given provider (e.g. \"tcp\", "
+			"\"verbs;ofi_rxm\", \"uet\") for single-part object GET/PUT, the libfabric "
+			"counterpart of \"--" ARG_CUOBJ_LONG "\". Requires a build with libfabric support "
+			"(ofi-rma) and an S3 endpoint that takes ofi-rma tokens, such as Ceph RGW.")
 		(ARG_TREEFILE_LONG, bpo::value(&this->treeFilePath),
 			"The path to a treefile containing a list of object names to use for shared upload or "
 			"download if the object size exceeds \"--" ARG_FILESHARESIZE_LONG "\".")
@@ -4091,6 +4134,12 @@ void ProgArgs::printVersionAndBuildInfo()
 	notIncludedStream << "cuobj/s3rdma ";
 #endif
 
+#ifdef OFI_SUPPORT
+	includedStream << "ofi/s3rdma ";
+#else
+	notIncludedStream << "ofi/s3rdma ";
+#endif
+
 #ifdef HDFS_SUPPORT
 	includedStream << "hdfs ";
 #else
@@ -4256,6 +4305,9 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
     s3NoMpuCompletion = tree.get<bool>(ARG_S3NOMPUCOMPLETION_LONG);
 	s3ObjectPrefix = tree.get<std::string>(ARG_S3OBJECTPREFIX_LONG);
 	s3Region = tree.get<std::string>(ARG_S3REGION_LONG);
+	s3OfiProvider = tree.get<std::string>(ARG_S3OFI_LONG, "");
+	s3OfiDomain = tree.get<std::string>(ARG_S3OFIDOMAIN_LONG, "");
+	s3OfiNode = tree.get<std::string>(ARG_S3OFINODE_LONG, "");
     s3SessionToken = tree.get<std::string>(ARG_S3SESSION_TOKEN_LONG);
 	s3SignPolicy = tree.get<unsigned short>(ARG_S3SIGNPAYLOAD_LONG);
     s3SSECKey = tree.get<std::string>(ARG_S3SSECKEY_LONG);
@@ -4444,6 +4496,9 @@ void ProgArgs::getAsPropertyTreeForService(bpt::ptree& outTree, size_t serviceRa
 	outTree.put(ARG_S3RANDOBJ_LONG, useS3RandObjSelect);
 	outTree.put(ARG_CUOBJ_LONG, useCuObj);
 	outTree.put(ARG_S3REGION_LONG, s3Region);
+	outTree.put(ARG_S3OFI_LONG, s3OfiProvider);
+	outTree.put(ARG_S3OFIDOMAIN_LONG, s3OfiDomain);
+	outTree.put(ARG_S3OFINODE_LONG, s3OfiNode);
     outTree.put(ARG_S3SESSION_TOKEN_LONG, s3SessionToken);
 	outTree.put(ARG_S3SIGNPAYLOAD_LONG, s3SignPolicy);
     outTree.put(ARG_S3SSE_LONG, useS3SSE);
