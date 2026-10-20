@@ -307,18 +307,36 @@ ssize_t S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx& ctx, const char* token, uin
 		ctx.rdmaChecksumCrc64nvme = resp->HasHeader(AMZ_RDMA_CHECKSUM_CRC64NVME) ?
 			std::string(resp->GetHeader(AMZ_RDMA_CHECKSUM_CRC64NVME).c_str() ) : "";
 
-		// Success: the server completed the RDMA_READ and returns a standard HTTP
-		// 200 + ETag (the object payload moved out-of-band; the HTTP body is empty).
-		if(httpStatus == 200 && !etag.empty() )
-		{
-			ctx.etag = etag;
-			return static_cast<ssize_t>(size);
-		}
-
-		// Otherwise inspect the RDMA reply marker: 501 (or absent) => declined.
 		const std::string reply = resp->HasHeader(AMZ_RDMA_REPLY) ?
 			std::string(resp->GetHeader(AMZ_RDMA_REPLY).c_str() ) : "";
 		const int replyCode = parseRdmaReply(reply);
+
+		/* Success: a 2xx with an ETag, and x-amz-rdma-reply 200 or 204, which says that the server
+			read the payload out of the client's memory (the HTTP body is empty). A 2xx without
+			x-amz-rdma-reply comes from a server that ignored the token and stored the empty body,
+			so it is a decline below, not a success. */
+		if( (httpStatus >= 200) && (httpStatus < 300) && !etag.empty() &&
+			( (replyCode == RDMA_REPLY_SUCCESS) || (replyCode == RDMA_REPLY_NO_CONTENT) ) )
+		{
+			if(resp->HasHeader(AMZ_RDMA_BYTES_TRANSFERRED) )
+			{
+				const std::string bytes = resp->GetHeader(AMZ_RDMA_BYTES_TRANSFERRED).c_str();
+				uint64_t n = 0;
+				auto [parsedEnd, ec] = std::from_chars(bytes.data(), bytes.data() + bytes.size(),
+					n);
+
+				if( (ec != std::errc{}) || (parsedEnd != bytes.data() + bytes.size() ) ||
+					(n != size) )
+				{
+					ERRLOGGER(Log_NORMAL, "rdmaPut: server read " << bytes << " bytes, sent " <<
+						size << "; key=" << ctx.object << std::endl);
+					return RDMA_ERROR;
+				}
+			}
+
+			ctx.etag = etag;
+			return static_cast<ssize_t>(size);
+		}
 
 		std::ostringstream body;
 		body << resp->GetResponseBody().rdbuf();
@@ -327,6 +345,8 @@ ssize_t S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx& ctx, const char* token, uin
 		{
 			ERRLOGGER(Log_NORMAL, "rdmaPut declined. http=" << httpStatus <<
 				"; x-amz-rdma-reply='" << reply << "'; key=" << ctx.object <<
+				( (httpStatus >= 200 && httpStatus < 300) ?
+					"; the server stored the empty HTTP body, not the RDMA payload" : "") <<
 				"; body=" << body.str().substr(0, 400) << std::endl);
 			return RDMA_NOT_SUPPORTED;
 		}

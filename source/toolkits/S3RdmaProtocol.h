@@ -61,9 +61,9 @@ namespace S3Rdma
 	 *    0  unparsable non-empty value: treat as failure by the caller
 	 *   -2  reply is "501" OR absent/empty: server declined RDMA
 	 *
-	 * A GET success carries x-amz-rdma-reply: 200/206; its absence (a non-RDMA
-	 * server never sets it) is read as a decline. PUT success is determined
-	 * separately by HTTP 200 + ETag.
+	 * A GET success carries x-amz-rdma-reply: 200/206, and a PUT success a 2xx
+	 * with an ETag and x-amz-rdma-reply: 200/204. Its absence (a non-RDMA
+	 * server never sets it) is read as a decline.
 	 */
 	inline int parseRdmaReply(const std::string& reply)
 	{

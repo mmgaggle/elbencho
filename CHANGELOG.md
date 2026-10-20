@@ -17,6 +17,7 @@
 * New option `--s3ofi PROVIDER` for S3-over-RDMA through libfabric (ofi-rma), the libfabric counterpart of `--cuobj`, for S3 servers that take ofi-rma tokens, such as Ceph RGW with OSD-direct transfers. It works with any provider that the storage nodes run, such as `tcp`, `verbs;ofi_rxm` or `uet`, and gives each buffer a new memory key after each request. `--s3ofidomain` and `--s3ofinode` choose the domain and the local address. The feature is enabled with `S3_SUPPORT=1` when pkg-config finds ofi-rma (`OFI_SUPPORT=0|1` overrides).
 * S3-over-RDMA transfers are also checked against the storage nodes' CRC of what they placed or read (`x-amz-rdma-checksum-crc64nvme`) when the server sends it, also for ranges.
 * An S3 error without `x-amz-rdma-reply`, such as `400 BadDigest`, is now reported as a failed RDMA request, not as a decline.
+* An S3-over-RDMA PUT now succeeds only if the server answers with `x-amz-rdma-reply` 200 or 204, and, if it sends `x-amz-rdma-bytes-transferred`, with the object size there. Before, any 200 with an ETag counted, so a server that ignored the token stored an empty object and the PUT still succeeded.
 * New option to specify a comma-separated weighted mix of block sizes, e.g. `-b 4k:3,64k:1` for 3 parts 4KiB and 1 part 64KiB (75%/25% mix), which is equivalent to using `-b 4k:75,64k:25`.
 
 ### General Changes
